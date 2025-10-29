@@ -13,6 +13,7 @@ from uuid import uuid4
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
 from collections import defaultdict
+from threading import Lock
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -232,6 +233,21 @@ class AgentTools:
                         "required": ["doc_identifier"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "summarize_document",
+                    "description": "Generate a comprehensive summary of an entire document. Use when the user requests a full summary.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "doc_identifier": {"type": "string", "description": "Filename or doc_id"},
+                            "max_pages": {"type": "integer", "description": "Maximum pages to include", "default": 20}
+                        },
+                        "required": []
+                    }
+                }
             }
         ]
 
@@ -331,9 +347,26 @@ Return as JSON array: {{"alternatives": ["phrase1", "phrase2", "phrase3"]}}"""
         """Search a specific page."""
         self.execution_log.append(f"📄 Agent searching page {page_number}" + (f" in {doc_identifier}" if doc_identifier else ""))
         
-        all_docs = self.doc_store.load_documents()
-        candidates = [d for d in all_docs if d.metadata.get("page_number") == page_number]
+        # Defensive: ensure page_number is an int
+        try:
+            page_number = int(page_number)
+        except Exception:
+            return {"error": f"Invalid page_number: {page_number}", "chunks": []}
         
+        all_docs = self.doc_store.load_documents()
+
+        # Normalize candidate selection: robust to metadata types (int or str)
+        def page_num_of(d):
+            pn = d.metadata.get("page_number", None)
+            try:
+                return int(pn)
+            except Exception:
+                return None
+
+        # Select candidates by page number
+        candidates = [d for d in all_docs if page_num_of(d) == page_number]
+        
+        # If a specific doc was requested, further filter
         if doc_identifier:
             candidates = [
                 d for d in candidates
@@ -341,17 +374,35 @@ Return as JSON array: {{"alternatives": ["phrase1", "phrase2", "phrase3"]}}"""
             ]
         
         if not candidates:
-            return {"error": f"Page {page_number} not found", "chunks": []}
+            # Provide helpful diagnostic if a doc_identifier was supplied
+            if doc_identifier:
+                pages_for_doc = sorted(
+                    {page_num_of(d) for d in all_docs
+                     if d.metadata.get("doc_id") == doc_identifier or doc_identifier in d.metadata.get("filename", "")}
+                )
+                return {
+                    "error": f"Page {page_number} not found in {doc_identifier}",
+                    "available_pages": pages_for_doc,
+                    "chunks": []
+                }
+            else:
+                return {"error": f"Page {page_number} not found", "chunks": []}
         
         retrieved = candidates[:1]
         self.execution_log.append(f"✅ Found page {page_number}")
         return self._format_results(retrieved)
     
-    def broad_search_all_documents(self, query: str, top_k: int = 5) -> Dict:
-        """Search across all documents."""
+    def broad_search_all_documents(self, query: str, top_k: int = 5, doc_identifiers: Optional[List[str]] = None) -> Dict:
+        """Search across all documents, or restrict to specific docs if provided."""
         self.execution_log.append(f"🌐 Agent performing broad search across all documents")
         top_k = int(top_k) if top_k is not None else 5
         all_docs = self.doc_store.load_documents()
+        if doc_identifiers:
+            allowed_ids = set(doc_identifiers)
+            all_docs = [
+                d for d in all_docs
+                if d.metadata.get("doc_id") in allowed_ids or d.metadata.get("filename") in allowed_ids
+            ]
         if not all_docs:
             return {"error": "No documents available", "chunks": []}
         retrieved = self._hybrid_retrieve(query, all_docs, top_k)
@@ -384,6 +435,133 @@ Return as JSON array: {{"alternatives": ["phrase1", "phrase2", "phrase3"]}}"""
             "pages": sorted(pages)
         }
     
+    def summarize_document(self, doc_identifier: str = None, max_pages: int = 20) -> Dict:
+        """Generate comprehensive summary of entire document, using map-reduce if needed."""
+        self.execution_log.append(f"📝 Generating full document summary")
+        
+        all_docs = self.doc_store.load_documents()
+        
+        if doc_identifier:
+            matching_docs = [
+                d for d in all_docs
+                if d.metadata.get("doc_id") == doc_identifier or doc_identifier in d.metadata.get("filename", "")
+            ]
+        else:
+            # If no specific doc, group by filename and pick the first one
+            if not all_docs:
+                return {"error": "No documents available"}
+            docs_by_file = defaultdict(list)
+            for doc in all_docs:
+                filename = doc.metadata.get("filename", "Unknown")
+                docs_by_file[filename].append(doc)
+            first_filename = list(docs_by_file.keys())[0]
+            matching_docs = docs_by_file[first_filename]
+            doc_identifier = first_filename
+        
+        if not matching_docs:
+            return {"error": "Document not found"}
+        
+        # Sort by page number
+        matching_docs.sort(key=lambda x: x.metadata.get("page_number", 0))
+        total_pages = len(matching_docs)
+
+        # If the document is small enough, summarize directly
+        if total_pages <= max_pages:
+            docs_to_summarize = matching_docs
+            full_text_parts = []
+            for doc in docs_to_summarize:
+                page_num = doc.metadata.get("page_number", "?")
+                content = doc.page_content[:1500]  # Limit per page
+                full_text_parts.append(f"[Page {page_num}]\n{content}")
+            full_text = "\n\n".join(full_text_parts)
+
+            summary_prompt = f"""You are summarizing a document. Provide a comprehensive summary.
+
+Document: {doc_identifier}
+Pages analyzed: {len(docs_to_summarize)}
+
+Content:
+{full_text[:8000]}  # Limit total context
+
+Create a structured summary with:
+1. **Document Title/Type**: What kind of document is this?
+2. **Main Topics**: What are the 3-5 main topics covered?
+3. **Key Points**: List 5-7 most important points or findings
+4. **Overall Purpose**: What is the document's main purpose or message?
+
+Be specific and detailed."""
+            try:
+                summary = self.llm.generate(summary_prompt, "You are a document summarization expert.")
+                self.execution_log.append(f"✅ Generated summary for {doc_identifier} ({len(docs_to_summarize)} pages)")
+                return {
+                    "summary": summary,
+                    "filename": doc_identifier,
+                    "pages_analyzed": len(docs_to_summarize),
+                    "total_pages": len(matching_docs),
+                    "chunks": [{"content": summary, "page": None, "filename": doc_identifier, "doc_id": "summary"}]
+                }
+            except Exception as e:
+                self.execution_log.append(f"❌ Summary generation failed: {str(e)}")
+                return {"error": f"Failed to generate summary: {str(e)}"}
+
+        # Map-Reduce: summarize in batches, then summarize the summaries
+        batch_summaries = []
+        batch_size = max_pages
+        for i in range(0, total_pages, batch_size):
+            batch = matching_docs[i:i + batch_size]
+            batch_text_parts = []
+            for doc in batch:
+                page_num = doc.metadata.get("page_number", "?")
+                content = doc.page_content[:1500]
+                batch_text_parts.append(f"[Page {page_num}]\n{content}")
+            batch_text = "\n\n".join(batch_text_parts)
+
+            batch_prompt = f"""Summarize the following pages of the document '{doc_identifier}'. Be specific and detailed.
+
+Pages: {batch[0].metadata.get("page_number", "?")} to {batch[-1].metadata.get("page_number", "?")}
+
+Content:
+{batch_text[:8000]}
+
+Return a concise summary of these pages."""
+            try:
+                batch_summary = self.llm.generate(batch_prompt, "You are a document summarization expert.")
+                batch_summaries.append(batch_summary)
+                self.execution_log.append(f"✅ Summarized pages {batch[0].metadata.get('page_number')}–{batch[-1].metadata.get('page_number')}")
+            except Exception as e:
+                self.execution_log.append(f"❌ Batch summary failed: {str(e)}")
+                batch_summaries.append(f"Summary failed for pages {batch[0].metadata.get('page_number')}–{batch[-1].metadata.get('page_number')}")
+
+        # Reduce step: summarize all batch summaries
+        reduce_prompt = f"""You are summarizing a long document. Below are summaries of different sections/pages.
+
+Document: {doc_identifier}
+Total pages: {total_pages}
+
+Section summaries:
+{chr(10).join(batch_summaries)}
+
+Create a structured overall summary with:
+1. **Document Title/Type**: What kind of document is this?
+2. **Main Topics**: What are the 3-5 main topics covered?
+3. **Key Points**: List 5-7 most important points or findings
+4. **Overall Purpose**: What is the document's main purpose or message?
+
+Be specific and detailed."""
+        try:
+            final_summary = self.llm.generate(reduce_prompt, "You are a document summarization expert.")
+            self.execution_log.append(f"✅ Generated final map-reduce summary for {doc_identifier}")
+            return {
+                "summary": final_summary,
+                "filename": doc_identifier,
+                "pages_analyzed": total_pages,
+                "total_pages": total_pages,
+                "chunks": [{"content": final_summary, "page": None, "filename": doc_identifier, "doc_id": "summary"}]
+            }
+        except Exception as e:
+            self.execution_log.append(f"❌ Final reduce summary failed: {str(e)}")
+            return {"error": f"Failed to generate final summary: {str(e)}"}
+
     def _hybrid_retrieve(self, query: str, candidates: List[Document], top_k: int) -> List[Document]:
         """Hybrid BM25 + Vector retrieval."""
         bm25 = BM25Retriever.from_documents(candidates)
@@ -438,7 +616,8 @@ Return as JSON array: {{"alternatives": ["phrase1", "phrase2", "phrase3"]}}"""
             "search_specific_documents": self.search_specific_documents,
             "search_specific_page": self.search_specific_page,
             "broad_search_all_documents": self.broad_search_all_documents,
-            "get_document_overview": self.get_document_overview
+            "get_document_overview": self.get_document_overview,
+            "summarize_document": self.summarize_document,  
         }
         
         if tool_name not in tool_map:
@@ -479,22 +658,28 @@ class AgenticRAG:
         system_prompt = """You are an intelligent document analysis agent powered by DeepSeek-V3.1-Terminus. You MUST use tools to retrieve information before answering.
 
 STRICT RULES:
-1. You MUST call list_all_documents first to see available documents
-2. You MUST call a search tool to retrieve relevant information
-3. You are NOT allowed to answer questions without using tools
-4. After using tools and retrieving information, then provide your answer
+1. You MUST call list_all_documents first to see available documents.
+2. For general questions about a document, you MUST use the summarize_document tool, which will summarize the entire document using a map-reduce approach if it is large.
+3. You MUST call a search, summary, or analysis tool to retrieve relevant information.
+4. You are NOT allowed to answer questions without using tools.
+5. After using tools and retrieving information, then provide your answer.
 
 AVAILABLE TOOLS:
-- list_all_documents: See what documents exist
-- search_specific_page: For "what's on page X" queries
-- search_specific_documents: Search in specific files
-- broad_search_all_documents: Search all documents
-- get_document_overview: Get document metadata
+- analyze_query: Analyze query intent, complexity, and information needs. Use FIRST to understand what the user wants.
+- expand_query: Generate alternative phrasings of the query to improve retrieval coverage.
+- list_all_documents: See what documents exist.
+- search_specific_documents: Search within specific documents by filename or doc_id.
+- search_specific_page: Search a specific page number in a document.
+- broad_search_all_documents: Search across all documents without restrictions.
+- get_document_overview: Get an overview of a specific document including total pages and metadata.
+- summarize_document: Generate a comprehensive summary of an entire document (uses map-reduce for large docs).
 
 PROCESS:
-1. Use list_all_documents
-2. Use appropriate search tool
-3. Only then provide answer based on retrieved info"""
+1. Use analyze_query and list_all_documents to understand the user query and available documents.
+2. Use summarize_document for general/document-level questions.
+3. Use expand_query if you need alternative phrasings for better retrieval.
+4. Use the appropriate search, summary, or overview tool (e.g., summarize_document for full summaries, search_specific_page for page queries).
+5. Only then provide an answer based on retrieved info."""
 
         user_message = f"""User Query: "{request.query}"
 
@@ -930,6 +1115,83 @@ logger.info(f"📚 Ready with {doc_store.count()} pages indexed")
 
 
 # =============================================================================
+# GLOBAL ANALYTICS STORE
+# =============================================================================
+
+class AnalyticsStore:
+    def __init__(self):
+        self.lock = Lock()
+        self.total_queries = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_response_time = 0.0
+        self.recent_queries = []
+
+    def log_query(self, query, input_tokens, output_tokens, response_time, docs_retrieved):
+        with self.lock:
+            self.total_queries += 1
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_response_time += response_time
+            self.recent_queries = ([{
+                "query": query,
+                "timestamp": datetime.now().isoformat(),
+                "responseTime": int(response_time * 1000),
+                "documentsRetrieved": docs_retrieved,
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens
+            }] + self.recent_queries)[:20]
+
+    def get(self):
+        avg_response = (self.total_response_time / self.total_queries) if self.total_queries else 0
+        return {
+            "totalQueries": self.total_queries,
+            "totalInputTokens": self.total_input_tokens,
+            "totalOutputTokens": self.total_output_tokens,
+            "totalTokens": self.total_input_tokens + self.total_output_tokens,
+            "avgResponseTime": int(avg_response * 1000),
+            "recentQueries": self.recent_queries,
+            "sambanovaCost": round((self.total_input_tokens + self.total_output_tokens) / 121_600_000 * 81.20, 2)  # $81.20 per 121.6M tokens
+        }
+
+analytics_store = AnalyticsStore()
+
+
+# =============================================================================
+# PATCHED METHODS
+# =============================================================================
+
+# Patch LLMService.generate to log analytics
+import time
+def generate_with_analytics(self, prompt: str, system_prompt: str, max_tokens: int = None) -> str:
+    start = time.time()
+    try:
+        response = self.client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            model=self.settings.llm_model,
+            temperature=self.settings.llm_temperature,
+            max_tokens=max_tokens or self.settings.llm_max_tokens,
+        )
+        content = response.choices[0].message.content.strip()
+        # Try to get token usage if available
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        elapsed = time.time() - start
+        # Log analytics (docs_retrieved is not known here, set to 0; will be updated in /query)
+        analytics_store.log_query(prompt, input_tokens, output_tokens, elapsed, 0)
+        return content
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        raise HTTPException(500, f"LLM error: {str(e)}")
+
+LLMService.generate = generate_with_analytics
+
+
+# =============================================================================
 # FASTAPI APP
 # =============================================================================
 
@@ -969,21 +1231,24 @@ async def root():
             "query": "POST /query",
             "health": "GET /health",
             "documents": "GET /documents",
-            "clear": "POST /clear"
+            "clear": "POST /clear",
+            "analytics": "GET /analytics"
         }
     }
 
 
 @app.get("/health")
 async def health():
-    count = doc_store.count()
+    all_docs = doc_store.load_documents()
+    unique_docs = set(doc.metadata.get("filename", "Unknown") for doc in all_docs)
     return {
         "status": "healthy",
         "agent_ready": True,
         "llm_provider": "NVIDIA NIM",
         "llm_model": settings.llm_model,
-        "documents_indexed": count,
-        "ready": count > 0
+        "documents_indexed": len(unique_docs),  # Number of unique PDFs
+        "pages_indexed": len(all_docs),         # Number of chunks/pages
+        "ready": len(unique_docs) > 0
     }
 
 
@@ -1029,6 +1294,10 @@ async def query(request: QueryRequest):
         logger.info(f"📨 Received query: {request.query}")
         result = agentic_rag.process_query(request)
         
+        # Update docs_retrieved for the last query
+        if analytics_store.recent_queries:
+            analytics_store.recent_queries[0]["documentsRetrieved"] = len(result.sources)
+        
         logger.info(f"📤 Returning: {len(result.agent_reasoning)} reasoning steps, {len(result.tools_used)} tools, {len(result.sources)} sources")
         
         return result
@@ -1063,6 +1332,11 @@ async def list_documents():
 async def clear_documents():
     count = doc_store.clear()
     return {"status": "success", "message": f"Cleared {count} pages"}
+
+
+@app.get("/analytics")
+async def get_analytics():
+    return analytics_store.get()
 
 
 if __name__ == "__main__":
